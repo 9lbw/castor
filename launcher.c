@@ -3,6 +3,7 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/Xft/Xft.h>
+#include <X11/Xatom.h>
 #include <X11/keysym.h>
 
 #include <err.h>
@@ -15,6 +16,13 @@
 #include <sys/types.h>  /* pid_t */
 
 #include "config.h"
+
+/* selection to paste from: "PRIMARY" or "CLIPBOARD" */
+static const char *paste_selection_name = "CLIPBOARD";
+
+/* default key for paste: Alt + v (Mod1Mask + XK_v) */
+static const unsigned int paste_modmask = Mod1Mask;
+static const KeySym paste_keysym = XK_v;
 
 static unsigned long
 parse_color(Display *dpy, int screen, const char *color)
@@ -94,6 +102,104 @@ draw(Display *dpy, XftDraw *draw, XftFont *font, XftColor *xft_fg,
 }
 
 static void
+insert_text(char *input, int *cursor, int *inlen, const char *text)
+{
+	size_t tlen;
+	int ins, i;
+
+	if (text == NULL)
+		return;
+
+	tlen = strlen(text);
+	if (tlen == 0)
+		return;
+
+	/* trim trailing newlines */
+	while (tlen > 0 &&
+	    (text[tlen - 1] == '\n' || text[tlen - 1] == '\r'))
+		tlen--;
+
+	if (tlen == 0)
+		return;
+
+	/* limit to remaining buffer space */
+	ins = (int)tlen;
+	if (*inlen + ins >= (int)input_max - 1)
+		ins = (int)input_max - 1 - *inlen;
+	if (ins <= 0)
+		return;
+
+	/* move tail to make room */
+	memmove(&input[*cursor + ins],
+	    &input[*cursor],
+	    (size_t)(*inlen - *cursor) + 1);
+
+	/* copy text */
+	for (i = 0; i < ins; i++)
+		input[*cursor + i] = text[i];
+
+	*cursor += ins;
+	*inlen += ins;
+}
+
+static void
+paste_selection(Display *dpy, Window win, Atom sel_atom,
+    char *input, int *cursor, int *inlen, int *scroll_x,
+    XftDraw *xftdraw, XftFont *font, XftColor *xft_fg)
+{
+	Atom prop, target, type;
+	int format;
+	unsigned long nitems, bytes_after;
+	unsigned char *data;
+
+	if (sel_atom == None)
+		return;
+
+	prop = XInternAtom(dpy, "XSEL_DATA", False);
+	target = XInternAtom(dpy, "UTF8_STRING", False);
+	if (target == None)
+		target = XA_STRING;
+
+	/* request conversion */
+	XConvertSelection(dpy, sel_atom, target, prop, win, CurrentTime);
+	XFlush(dpy);
+
+	data = NULL;
+	for (;;) {
+		XEvent ev;
+
+		XNextEvent(dpy, &ev);
+
+		if (ev.type == SelectionNotify &&
+		    ev.xselection.requestor == win) {
+			if (ev.xselection.property == None)
+				break;
+
+			if (XGetWindowProperty(dpy, win, prop, 0, ~0L,
+			    True, AnyPropertyType, &type, &format,
+			    &nitems, &bytes_after, &data) == Success &&
+			    type != None && data != NULL) {
+				insert_text(input, cursor, inlen,
+				    (const char *)data);
+				XFree(data);
+				data = NULL;
+			}
+			break;
+		}
+
+		/* keep window responsive while waiting */
+		if (ev.type == Expose) {
+			*scroll_x = draw(dpy, xftdraw, font, xft_fg,
+			    input, *cursor, *inlen, *scroll_x);
+		}
+		/* ignore other events during paste */
+	}
+
+	*scroll_x = draw(dpy, xftdraw, font, xft_fg,
+	    input, *cursor, *inlen, *scroll_x);
+}
+
+static void
 run_command(const char *input)
 {
 	pid_t pid;
@@ -110,14 +216,12 @@ run_command(const char *input)
 		/* child */
 		setsid();
 		execl("/bin/sh", "sh", "-c", input, (char *)NULL);
-		/* only reached on error */
 		warn("execl /bin/sh");
 		_exit(127);
 	}
 
 	/* parent: don't wait */
 }
-
 
 int
 main(void)
@@ -138,6 +242,7 @@ main(void)
 	int running, focused, cursor, inlen, scroll_x;
 	unsigned long bg, border;
 	Atom wm_delete_window;
+	Atom sel_clipboard;
 
 	/* ignore SIGCHLD to avoid zombies from launched processes */
 	signal(SIGCHLD, SIG_IGN);
@@ -190,13 +295,17 @@ main(void)
 	XSetWMProtocols(dpy, win, &wm_delete_window, 1);
 
 	XSelectInput(dpy, win,
-	    ExposureMask | KeyPressMask | FocusChangeMask);
+	    ExposureMask | KeyPressMask | FocusChangeMask | StructureNotifyMask);
 
 	XMapWindow(dpy, win);
+	XFlush(dpy);
 
 	xftdraw = XftDrawCreate(dpy, win, vis, cmap);
 	if (xftdraw == NULL)
 		errx(1, "cannot create XftDraw");
+
+	/* selection atom for paste (CLIPBOARD by default) */
+	sel_clipboard = XInternAtom(dpy, paste_selection_name, False);
 
 	input[0] = '\0';
 	cursor = 0;
@@ -218,7 +327,7 @@ main(void)
 			    input, cursor, inlen, scroll_x);
 			break;
 		case FocusOut:
-			/* running = 0; */
+			/* no auto-close on focus out to avoid keybind races */
 			break;
 		case ClientMessage:
 			if ((Atom)ev.xclient.data.l[0] == wm_delete_window)
@@ -226,6 +335,15 @@ main(void)
 			break;
 		case KeyPress:
 			key = XLookupKeysym(&ev.xkey, 0);
+
+			/* paste from selection (Alt+v by default) */
+			if ((ev.xkey.state & paste_modmask) &&
+			    key == paste_keysym) {
+				paste_selection(dpy, win, sel_clipboard,
+				    input, &cursor, &inlen, &scroll_x,
+				    xftdraw, font, &xft_fg);
+				break;
+			}
 
 			if (key == XK_Escape) {
 				running = 0;
@@ -275,7 +393,8 @@ main(void)
 					    &xft_fg, input, cursor, inlen,
 					    scroll_x);
 				}
-			} else if ((ev.xkey.state & ControlMask) && key == XK_u) {
+			} else if ((ev.xkey.state & ControlMask) &&
+			    key == XK_u) {
 				/* Ctrl-U: clear line */
 				cursor = 0;
 				inlen = 0;
@@ -284,7 +403,9 @@ main(void)
 				scroll_x = draw(dpy, xftdraw, font,
 				    &xft_fg, input, cursor, inlen, scroll_x);
 			} else {
-				int len = XLookupString(&ev.xkey, buf,
+				int len;
+
+				len = XLookupString(&ev.xkey, buf,
 				    (int)sizeof(buf), NULL, NULL);
 				if (len > 0 &&
 				    inlen + len < (int)input_max - 1) {
